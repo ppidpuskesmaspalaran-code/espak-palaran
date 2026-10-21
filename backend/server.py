@@ -618,6 +618,7 @@ async def upload_certificate(
     await db.certificates.insert_one(dict(doc))
     await log_activity(user, f"Upload sertifikat: {nama_pelatihan}", "Sertifikat", request)
     await notify(user["id"], "Sertifikat Terunggah", f"Sertifikat '{nama_pelatihan}' berhasil diunggah dan menunggu verifikasi.", "info")
+    await broadcast_realtime("certificate_uploaded", {"cert_id": doc["id"], "employee_id": user["id"]})
     return clean(doc)
 
 
@@ -639,6 +640,7 @@ async def verify_certificate(cert_id: str, data: VerifyInput, request: Request, 
         await notify(cert["employee_id"], "Sertifikat Disetujui", f"Sertifikat '{cert['nama_pelatihan']}' telah disetujui ({cert['jpl']} JPL).", "success")
     else:
         await notify(cert["employee_id"], "Sertifikat Ditolak", f"Sertifikat '{cert['nama_pelatihan']}' ditolak. Alasan: {data.catatan}", "error")
+    await broadcast_realtime("certificate_verified", {"cert_id": cert_id, "status": data.status, "employee_id": cert["employee_id"]})
     return {"ok": True}
 
 
@@ -650,6 +652,7 @@ async def delete_certificate(cert_id: str, user: dict = Depends(get_current_user
     if not has_role(user, "admin") and cert["employee_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Akses ditolak")
     await db.certificates.delete_one({"id": cert_id})
+    await broadcast_realtime("certificate_deleted", {"cert_id": cert_id, "employee_id": cert["employee_id"]})
     return {"ok": True}
 
 
@@ -782,6 +785,7 @@ async def create_report(data: ReportInput, request: Request, user: dict = Depend
         await db.indicator_reports.insert_one(dict(doc))
         rid = doc["id"]
     await log_activity(user, f"Input capaian indikator ({capaian}%)", "Input Data SPM", request)
+    await broadcast_realtime("spm_updated", {"indicator_id": data.indicator_id, "bulan": data.bulan, "tahun": data.tahun, "capaian": capaian})
     return {"ok": True, "id": rid, "capaian": capaian, "status": status}
 
 
@@ -1601,6 +1605,7 @@ async def set_leave_balance(employee_id: str, data: BalanceInput, request: Reque
         upd["tahun"] = data.tahun
     await db.leave_balances.update_one({"employee_id": employee_id}, {"$set": upd})
     await log_activity(user, f"Atur saldo cuti pegawai {employee_id}", "Cuti", request)
+    await broadcast_realtime("leave_balance_updated", {"employee_id": employee_id})
     return {"ok": True}
 
 
@@ -1706,6 +1711,7 @@ async def create_leave(data: LeaveInput, request: Request, user: dict = Depends(
             await notify(a["id"], "Pengajuan Cuti Baru", f"{emp['nama']} mengajukan cuti {data.jenis} {days} hari.", "info")
     else:
         await notify(emp_id, "Cuti Ditambahkan", f"Cuti {data.jenis} {days} hari telah dicatat & disetujui admin.", "success")
+    await broadcast_realtime("leave_created", {"leave_id": doc["id"], "employee_id": emp_id, "status": doc["status"]})
     return clean(doc)
 
 
@@ -1733,6 +1739,7 @@ async def verify_leave(leave_id: str, data: LeaveVerify, request: Request, user:
     tipe = "success" if data.status == "disetujui" else "error"
     extra = f" Alasan: {data.catatan}" if data.status == "ditolak" else ""
     await notify(lv["employee_id"], f"Cuti {data.status.capitalize()}", f"Pengajuan cuti {lv['jenis']} {lv['jumlah_hari']} hari {data.status}.{extra}", tipe)
+    await broadcast_realtime("leave_verified", {"leave_id": leave_id, "status": data.status, "employee_id": lv["employee_id"]})
     return {"ok": True}
 
 
@@ -1751,6 +1758,7 @@ async def cancel_leave(leave_id: str, request: Request, user: dict = Depends(req
     await db.leaves.update_one({"id": leave_id}, {"$set": {"status": "dibatalkan", "deduksi": {}, "catatan": "Dibatalkan oleh admin", "verified_by": user["nama"], "verified_at": now_iso()}})
     await log_activity(user, "Pembatalan cuti", "Cuti", request)
     await notify(lv["employee_id"], "Cuti Dibatalkan", f"Cuti {lv['jenis']} {lv['jumlah_hari']} hari dibatalkan admin. Saldo dikembalikan.", "info")
+    await broadcast_realtime("leave_cancelled", {"leave_id": leave_id, "employee_id": lv["employee_id"]})
     return {"ok": True}
 
 
@@ -1762,6 +1770,7 @@ async def delete_leave(leave_id: str, user: dict = Depends(get_current_user)):
     if not has_role(user, "admin") and (lv["employee_id"] != user["id"] or lv["status"] != "diajukan"):
         raise HTTPException(status_code=403, detail="Hanya pengajuan berstatus diajukan milik sendiri yang dapat dihapus")
     await db.leaves.delete_one({"id": leave_id})
+    await broadcast_realtime("leave_deleted", {"leave_id": leave_id, "employee_id": lv["employee_id"]})
     return {"ok": True}
 
 

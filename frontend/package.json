@@ -80,8 +80,8 @@
   "devDependencies": {
     "@babel/plugin-proposal-private-property-in-object": "7.21.11",
     "@craco/craco": "7.1.0",
-    "@emergentbase/overlay": "https://assets.emergent.sh/npm/emergentbase-overlay-0.1.29.tgz",
-    "@emergentbase/visual-edits": "https://assets.emergent.sh/npm/emergentbase-visual-edits-1.0.13.tgz",
+    "ajv": "^8.17.1",
+    "ajv-keywords": "^5.1.0",
     "@eslint/js": "9.23.0",
     "@types/lodash": "4.17.24",
     "autoprefixer": "10.4.20",
@@ -95,7 +95,13 @@
     "postcss": "8.5.10",
     "tailwindcss": "3.4.17"
   },
+  "overrides": {
+    "ajv": "^8.17.1",
+    "ajv-keywords": "^5.1.0"
+  },
   "resolutions": {
+    "ajv": "^8.17.1",
+    "ajv-keywords": "^5.1.0",
     "react-router": "7.15.1",
     "node-forge": "1.4.0",
     "fast-uri": "3.1.2",
