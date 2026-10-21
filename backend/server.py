@@ -5,7 +5,7 @@ import os
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends, UploadFile, File, Form, Query, Header
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends, UploadFile, File, Form, Query, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -32,17 +32,18 @@ from reportlab.lib.enums import TA_CENTER
 # ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
-mongo_url = os.environ['MONGO_URL']
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+db_name = os.environ.get('DB_NAME', 'espak')
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db = client[db_name]
 
-app = FastAPI()
+app = FastAPI(title="E-SPAK API", version="1.0.0")
 api_router = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("espak")
 
-JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_SECRET = os.environ.get("JWT_SECRET", "espak_secret_key_default_puskesmas_palaran_2026")
 JWT_ALGORITHM = "HS256"
 
 # ----------------------------------------------------------------------------
@@ -216,11 +217,80 @@ async def log_activity(user: dict, aktivitas: str, module: str, request: Request
     })
 
 
-async def notify(user_id: str, judul: str, pesan: str, tipe: str = "info"):
-    await db.notifications.insert_one({
+# ----------------------------------------------------------------------------
+# Real-Time WebSocket Manager
+# ----------------------------------------------------------------------------
+class ConnectionManager:
+    def __init__(self):
+        self.user_sockets: dict[str, set[WebSocket]] = {}
+        self.all_sockets: set[WebSocket] = set()
+
+    async def connect(self, ws: WebSocket, user_id: str):
+        await ws.accept()
+        if user_id not in self.user_sockets:
+            self.user_sockets[user_id] = set()
+        self.user_sockets[user_id].add(ws)
+        self.all_sockets.add(ws)
+        logger.info(f"WebSocket client connected: user={user_id}. Active: {len(self.all_sockets)}")
+
+    def disconnect(self, ws: WebSocket, user_id: str):
+        if user_id in self.user_sockets:
+            self.user_sockets[user_id].discard(ws)
+            if not self.user_sockets[user_id]:
+                del self.user_sockets[user_id]
+        self.all_sockets.discard(ws)
+        logger.info(f"WebSocket client disconnected: user={user_id}. Active: {len(self.all_sockets)}")
+
+    async def send_to_user(self, user_id: str, message: dict):
+        if user_id in self.user_sockets:
+            dead = []
+            for ws in list(self.user_sockets[user_id]):
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                self.disconnect(ws, user_id)
+
+    async def broadcast(self, message: dict, exclude_user: Optional[str] = None):
+        dead = []
+        for ws in list(self.all_sockets):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.all_sockets.discard(ws)
+
+ws_manager = ConnectionManager()
+
+
+async def broadcast_realtime(event_name: str, payload: dict = None, exclude_user_id: Optional[str] = None):
+    try:
+        await ws_manager.broadcast({
+            "type": "event",
+            "event": event_name,
+            "payload": payload or {},
+            "timestamp": now_iso()
+        }, exclude_user=exclude_user_id)
+    except Exception as e:
+        logger.debug(f"WS broadcast error: {e}")
+
+
+async def notify(user_id: str, judul: str, pesan: str, tipe: str = "info", extra: dict = None):
+    doc = {
         "id": str(uuid.uuid4()), "user_id": user_id, "judul": judul, "pesan": pesan,
         "tipe": tipe, "is_read": False, "created_at": now_iso(),
-    })
+    }
+    await db.notifications.insert_one(doc)
+    try:
+        await ws_manager.send_to_user(user_id, {
+            "type": "notification",
+            "notification": clean(doc),
+            "extra": extra or {}
+        })
+    except Exception as e:
+        logger.debug(f"WS notify error: {e}")
 
 
 # ----------------------------------------------------------------------------
@@ -2011,14 +2081,62 @@ async def delete_sip(sip_id: str, user: dict = Depends(get_current_user)):
 
 
 # ----------------------------------------------------------------------------
+# WebSocket Real-Time Endpoints
+# ----------------------------------------------------------------------------
+@app.websocket("/api/ws")
+@app.websocket("/ws")
+@api_router.websocket("/ws")
+async def websocket_realtime_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
+    user_id = "anonymous"
+    user_role = "guest"
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            user_id = payload.get("sub", "anonymous")
+            user_role = payload.get("role", "guest")
+        except Exception as e:
+            logger.debug(f"WS auth token invalid: {e}")
+
+    await ws_manager.connect(websocket, user_id)
+    try:
+        await websocket.send_json({
+            "type": "welcome",
+            "message": "Connected to E-SPAK Realtime Server",
+            "user_id": user_id,
+            "role": user_role,
+            "timestamp": now_iso()
+        })
+        while True:
+            text = await websocket.receive_text()
+            try:
+                msg = json.loads(text)
+                if msg.get("type") == "ping":
+                    await websocket.send_json({"type": "pong", "timestamp": now_iso()})
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket, user_id)
+    except Exception as e:
+        logger.debug(f"WS error: {e}")
+        ws_manager.disconnect(websocket, user_id)
+
+
+# ----------------------------------------------------------------------------
 # Include router + middleware
 # ----------------------------------------------------------------------------
 app.include_router(api_router)
 
+cors_origins_env = os.environ.get('CORS_ORIGINS', '*')
+if cors_origins_env.strip() == '*':
+    cors_origins = ["*"]
+else:
+    cors_origins = [o.strip() for o in cors_origins_env.split(',') if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=cors_origins,
+    allow_origin_regex=".*" if cors_origins == ["*"] else None,
     allow_methods=["*"],
     allow_headers=["*"],
 )
